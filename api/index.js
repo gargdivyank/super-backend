@@ -104,9 +104,14 @@ app.use((err, req, res, next) => {
 });
 
 // Create serverless handler
-const handler = serverless(app);
+const handler = serverless(app, {
+  binary: ['image/*', 'application/pdf']
+});
 
 // Export handler as default for Vercel (serverless deployment)
-// Also export app as a property for local development (server.js)
 module.exports = handler;
-module.exports.app = app;
+
+// Also export app as a property for local development (server.js)
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports.app = app;
+}
