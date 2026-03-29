@@ -50,9 +50,19 @@ const landingPageSchema = new mongoose.Schema({
     trim: true,
     unique: true
   },
+  originalUrl: {
+    type: String,
+    required: true,
+    trim: true
+  },
   url: {
     type: String,
     required: [true, 'Please provide landing page URL'],
+    unique: true
+  },
+  trackingKey: {
+    type: String,
+    required: [true, 'Please provide tracking key'],
     unique: true
   },
   description: {

@@ -5,6 +5,7 @@ const LandingPage = require('../models/LandingPage');
 const AdminAccess = require('../models/AdminAccess');
 const { protect, authorize, checkApproval } = require('../middleware/auth');
 const asyncHandler = require('../utils/asyncHandler');
+const { scheduleLeadAutoReplies } = require('../utils/leadAutoReply');
 
 const router = express.Router();
 
@@ -16,10 +17,10 @@ const router = express.Router();
 // @route   POST /api/leads
 // @access  Public
 router.post('/', asyncHandler(async (req, res) => {
-  const { landingPageId, ...formData } = req.body;
+  const { trackingKey, source, ...formData } = req.body;
 
   // Check if landing page exists
-  const landingPage = await LandingPage.findById(landingPageId);
+  const landingPage = await LandingPage.findOne({ trackingKey });
   if (!landingPage || landingPage.status !== 'active') {
     return res.status(400).json({
       success: false,
@@ -29,10 +30,11 @@ router.post('/', asyncHandler(async (req, res) => {
 
   // Prepare lead data
   const leadData = {
-    landingPage: landingPageId,
+    landingPage: landingPage._id,
     ipAddress: req.ip,
     userAgent: req.get('User-Agent'),
-    dynamicFields: new Map()
+    dynamicFields: new Map(),
+    source: source || 'landing_page',
   };
 
   // Process default fields based on landing page configuration
@@ -79,7 +81,7 @@ router.post('/', asyncHandler(async (req, res) => {
   }
 
   // Define standard field names that should not be stored in dynamicFields
-  const standardFields = ['firstName', 'lastName', 'email', 'phone', 'landingPageId'];
+  const standardFields = ['firstName', 'lastName', 'email', 'phone', 'landingPageId', 'source'];
   
   // Process dynamic form fields (both configured and unconfigured)
   for (const [fieldName, fieldValue] of Object.entries(formData)) {
@@ -105,6 +107,9 @@ router.post('/', asyncHandler(async (req, res) => {
 
   // Create lead
   const lead = await Lead.create(leadData);
+
+  // Auto-reply email + WhatsApp (non-blocking; failures are logged only)
+  scheduleLeadAutoReplies(lead, landingPage);
 
   res.status(201).json({
     success: true,

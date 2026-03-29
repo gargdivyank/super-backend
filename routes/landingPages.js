@@ -4,6 +4,9 @@ const LandingPage = require('../models/LandingPage');
 const { protect, authorize } = require('../middleware/auth');
 const asyncHandler = require('../utils/asyncHandler');
 
+function generateTrackingKey(){
+  return "LP_" + Math.random().toString(36).substring(2, 8).toUpperCase();
+}
 const router = express.Router();
 
 // Protect all routes after this middleware
@@ -40,11 +43,17 @@ router.post('/', [
     });
   }
 
+  const trackingKey = generateTrackingKey();
+   const finalUrl= `${url}/${trackingKey}`;
+
+   console.log("Generated Tracking Key:", trackingKey);
+  console.log("Final URL with trackingKey:", finalUrl);
   // Create landing page
   const landingPage = await LandingPage.create({
     name,
-    url,
+    url: finalUrl,
     description,
+    trackingKey,
     createdBy: req.user.id
   });
 

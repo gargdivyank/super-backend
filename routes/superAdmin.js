@@ -1,4 +1,6 @@
 const express = require('express');
+const multer = require('multer');
+const mongoose = require('mongoose');
 const { body, validationResult } = require('express-validator');
 const User = require('../models/User');
 const LandingPage = require('../models/LandingPage');
@@ -6,9 +8,18 @@ const Lead = require('../models/Lead');
 const AdminAccess = require('../models/AdminAccess');
 const { protect, authorize } = require('../middleware/auth');
 const asyncHandler = require('../utils/asyncHandler');
+const { parseLeadCSV } = require('../utils/csvParser');
 
 const router = express.Router();
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } }); // 5MB
 
+function generateTrackingKey(){
+   return "LP_" + Math.random().toString(36).substring(2, 8).toUpperCase();
+}
+
+function isValidObjectId(id) {
+  return id && id !== 'undefined' && mongoose.Types.ObjectId.isValid(id);
+}
 // Protect all routes after this middleware
 router.use(protect);
 router.use(authorize('super_admin'));
@@ -86,7 +97,7 @@ router.post('/landing-pages', [
 
   // Check if landing page already exists
   const existingLandingPage = await LandingPage.findOne({
-    $or: [{ name }, { url }]
+    $or: [{ name }, { originalUrl: url }]
   });
 
   if (existingLandingPage) {
@@ -95,12 +106,21 @@ router.post('/landing-pages', [
       message: 'Landing page with this name or URL already exists'
     });
   }
+   const trackingKey = generateTrackingKey();
+  //  const finalUrl= `${url}/${trackingKey}`;
+  const parsedUrl = new URL(url);
+  parsedUrl.searchParams.set('tk', trackingKey);
+  const finalUrl = parsedUrl.toString();
 
+   console.log("Generated Tracking Key:", trackingKey);
+   console.log("Final URL with trackingKey:", finalUrl);
   // Create landing page
   const landingPage = await LandingPage.create({
     name,
-    url,
+    originalUrl: url,
+    url: finalUrl,
     description,
+    trackingKey,
     createdBy: req.user.id
   });
 
@@ -127,6 +147,13 @@ router.put('/landing-pages/:id', [
     return res.status(400).json({
       success: false,
       errors: errors.array()
+    });
+  }
+
+  if (!isValidObjectId(req.params.id)) {
+    return res.status(400).json({
+      success: false,
+      message: 'Invalid landing page ID'
     });
   }
 
@@ -185,6 +212,13 @@ router.put('/landing-pages/:id', [
 // @route   DELETE /api/super-admin/landing-pages/:id
 // @access  Private (Super Admin only)
 router.delete('/landing-pages/:id', asyncHandler(async (req, res) => {
+  if (!isValidObjectId(req.params.id)) {
+    return res.status(400).json({
+      success: false,
+      message: 'Invalid landing page ID'
+    });
+  }
+
   const landingPage = await LandingPage.findById(req.params.id);
 
   if (!landingPage) {
@@ -493,16 +527,16 @@ router.delete('/sub-admins/:id', asyncHandler(async (req, res) => {
   }
 
   // Check if sub admin has any leads
-  const leadCount = await Lead.countDocuments({
-    landingPage: { $in: await AdminAccess.distinct('landingPage', { subAdmin: req.params.id }) }
-  });
+  // const leadCount = await Lead.countDocuments({
+  //   landingPage: { $in: await AdminAccess.distinct('landingPage', { subAdmin: req.params.id }) }
+  // });
 
-  if (leadCount > 0) {
-    return res.status(400).json({
-      success: false,
-      message: `Cannot delete sub admin. There are ${leadCount} leads associated with their landing pages.`
-    });
-  }
+  // if (leadCount > 0) {
+  //   return res.status(400).json({
+  //     success: false,
+  //     message: `Cannot delete sub admin. There are ${leadCount} leads associated with their landing pages.`
+  //   });
+  // }
 
   // Remove admin access records
   await AdminAccess.deleteMany({ subAdmin: req.params.id });
@@ -538,9 +572,46 @@ router.get('/leads', asyncHandler(async (req, res) => {
   }
 
   // Filter by landing page if provided
-  if (landingPage) {
-    query.landingPage = landingPage;
-  }
+  // if (landingPage) {
+  //   query.landingPage = landingPage;
+  // }
+  // Only show leads from ACTIVE landing pages
+const activeLandingPageIds = await LandingPage
+.find({ status: 'active' })
+.distinct('_id');
+
+if (!activeLandingPageIds.length) {
+return res.status(200).json({
+  success: true,
+  count: 0,
+  pagination: {},
+  total: 0,
+  data: []
+});
+}
+
+if (landingPage) {
+const isActive = activeLandingPageIds.some(
+  (id) => id.toString() === landingPage.toString()
+);
+
+// If selected landing page is inactive => show no leads (do NOT delete)
+if (!isActive) {
+  return res.status(200).json({
+    success: true,
+    count: 0,
+    pagination: {},
+    total: 0,
+    data: []
+  });
+}
+
+// landingPage is active => filter by it
+query.landingPage = landingPage;
+} else {
+// no landingPage filter => show leads from all active pages
+query.landingPage = { $in: activeLandingPageIds };
+}
 
   // Filter by date range if provided
   if (startDate || endDate) {
@@ -600,6 +671,125 @@ router.get('/leads', asyncHandler(async (req, res) => {
   });
 }));
 
+// @desc    Update lead (status, lastContacted, and details)
+// @route   PUT /api/super-admin/leads/:id
+// @access  Private (Super Admin only)
+router.put('/leads/:id', [
+  body('firstName').optional().trim().isLength({ min: 2 }).withMessage('First name must be at least 2 characters'),
+  body('lastName').optional().trim().isLength({ min: 2 }).withMessage('Last name must be at least 2 characters'),
+  body('email').optional().isEmail().normalizeEmail().withMessage('Please provide a valid email'),
+  body('phone').optional().trim(),
+  body('company').optional().trim(),
+  body('message').optional().trim(),
+  body('status').optional().isIn(['new', 'contacted', 'qualified', 'converted', 'lost']).withMessage('Invalid status'),
+  body('lastContacted').optional().isISO8601().toDate()
+], asyncHandler(async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({
+      success: false,
+      errors: errors.array()
+    });
+  }
+
+  const lead = await Lead.findById(req.params.id).populate('landingPage');
+  if (!lead) {
+    return res.status(404).json({
+      success: false,
+      message: 'Lead not found'
+    });
+  }
+
+  const fieldsToUpdate = {
+    firstName: req.body.firstName,
+    lastName: req.body.lastName,
+    email: req.body.email,
+    phone: req.body.phone,
+    company: req.body.company,
+    message: req.body.message,
+    status: req.body.status,
+    lastContacted: req.body.lastContacted
+  };
+
+  Object.keys(fieldsToUpdate).forEach(key =>
+    fieldsToUpdate[key] === undefined && delete fieldsToUpdate[key]
+  );
+
+  const updatedLead = await Lead.findByIdAndUpdate(
+    req.params.id,
+    fieldsToUpdate,
+    { new: true, runValidators: true }
+  ).populate('landingPage', 'name url');
+
+  res.status(200).json({
+    success: true,
+    message: 'Lead updated successfully',
+    data: updatedLead
+  });
+}));
+
+// @desc    Upload CSV to update leads (status, lastContacted, etc.)
+// @route   POST /api/super-admin/leads/upload
+// @access  Private (Super Admin only)
+const VALID_STATUSES = ['new', 'contacted', 'qualified', 'converted', 'lost'];
+router.post('/leads/upload', upload.single('file'), asyncHandler(async (req, res) => {
+  if (!req.file || !req.file.buffer) {
+    return res.status(400).json({
+      success: false,
+      message: 'Please upload a CSV file',
+      updated: 0,
+      failed: 0,
+      errors: []
+    });
+  }
+
+  const { rows, errors: parseErrors } = parseLeadCSV(req.file.buffer);
+  const errors = [...(parseErrors || [])];
+  let updated = 0;
+  let failed = 0;
+
+  for (const row of rows) {
+    const email = (row.email || '').trim().toLowerCase();
+    if (!email) {
+      failed++;
+      continue;
+    }
+    const lead = await Lead.findOne({ email: email.toLowerCase() });
+    if (!lead) {
+      errors.push(`No lead found with email: ${row.email}`);
+      failed++;
+      continue;
+    }
+    const updates = {};
+    if (row.firstName) updates.firstName = row.firstName;
+    if (row.lastName) updates.lastName = row.lastName;
+    if (row.phone !== undefined) updates.phone = row.phone;
+    if (row.company !== undefined) updates.company = row.company;
+    if (row.message !== undefined) updates.message = row.message;
+    if (row.status && VALID_STATUSES.includes(row.status.toLowerCase())) {
+      updates.status = row.status.toLowerCase();
+    }
+    if (row.lastContacted) {
+      const d = new Date(row.lastContacted);
+      if (!isNaN(d.getTime())) updates.lastContacted = d;
+    }
+    if (Object.keys(updates).length === 0) {
+      failed++;
+      continue;
+    }
+    await Lead.findByIdAndUpdate(lead._id, updates, { runValidators: true });
+    updated++;
+  }
+
+  res.status(200).json({
+    success: true,
+    message: `Leads update complete. Updated: ${updated}, Failed: ${failed}`,
+    updated,
+    failed,
+    errors: errors.length ? errors : undefined
+  });
+}));
+
 // @desc    Export leads
 // @route   GET /api/super-admin/leads/export
 // @access  Private (Super Admin only)
@@ -615,8 +805,43 @@ router.get('/leads/export', asyncHandler(async (req, res) => {
   let query = {};
 
   // Apply same filters as get leads
-  if (status) query.status = status;
-  if (landingPage) query.landingPage = landingPage;
+  // if (status) query.status = status;
+  // if (landingPage) query.landingPage = landingPage;
+   // Only export leads from ACTIVE landing pages
+const activeLandingPageIds = await LandingPage
+.find({ status: 'active' })
+.distinct('_id');
+
+if (!activeLandingPageIds.length) {
+return res.status(200).json({
+  success: true,
+  count: 0,
+  data: []
+});
+}
+
+// Apply same filters as get leads
+if (status) query.status = status;
+
+if (landingPage) {
+const isActive = activeLandingPageIds.some(
+  (id) => id.toString() === landingPage.toString()
+);
+
+// If selected landing page is inactive => export nothing
+if (!isActive) {
+  return res.status(200).json({
+    success: true,
+    count: 0,
+    data: []
+  });
+}
+
+query.landingPage = landingPage;
+} else {
+query.landingPage = { $in: activeLandingPageIds };
+}
+
   if (search) {
     query.$or = [
       { firstName: { $regex: search, $options: 'i' } },

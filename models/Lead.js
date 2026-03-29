@@ -47,6 +47,17 @@ const leadSchema = new mongoose.Schema({
     enum: ['new', 'contacted', 'qualified', 'converted', 'lost'],
     default: 'new'
   },
+  geoLocation: {  // Change this field to store a human-readable address
+    type: String,  // Store address as a string
+    default: "Unknown location"
+  },
+  deviceType: { // New field for deviceType
+    type: String,
+    enum: ['Mobile', 'Tablet', 'Desktop'],
+  },
+  lastContacted: {
+    type: Date
+  },
   source: {
     type: String,
     default: 'landing_page'

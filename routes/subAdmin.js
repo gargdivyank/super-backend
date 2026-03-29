@@ -1,4 +1,5 @@
 const express = require('express');
+const multer = require('multer');
 const { body, validationResult } = require('express-validator');
 const User = require('../models/User');
 const Lead = require('../models/Lead');
@@ -6,8 +7,10 @@ const AdminAccess = require('../models/AdminAccess');
 const LandingPage = require('../models/LandingPage');
 const { protect, authorize, checkApproval } = require('../middleware/auth');
 const asyncHandler = require('../utils/asyncHandler');
+const { parseLeadCSV } = require('../utils/csvParser');
 
 const router = express.Router();
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } }); // 5MB
 
 // Protect all routes after this middleware
 router.use(protect);
@@ -253,6 +256,86 @@ router.get('/leads/export', asyncHandler(async (req, res) => {
   });
 }));
 
+// @desc    Upload CSV to update leads (status, lastContacted, etc.) for sub-admin's leads only
+// @route   POST /api/sub-admin/leads/upload
+// @access  Private (Sub Admin only)
+const VALID_STATUSES = ['new', 'contacted', 'qualified', 'converted', 'lost'];
+router.post('/leads/upload', upload.single('file'), asyncHandler(async (req, res) => {
+  if (!req.file || !req.file.buffer) {
+    return res.status(400).json({
+      success: false,
+      message: 'Please upload a CSV file',
+      updated: 0,
+      failed: 0,
+      errors: []
+    });
+  }
+
+  const accessRecords = await AdminAccess.find({
+    subAdmin: req.user.id,
+    status: 'active'
+  });
+  const landingPageIds = accessRecords.map((r) => r.landingPage);
+  if (landingPageIds.length === 0) {
+    return res.status(200).json({
+      success: true,
+      message: 'No landing pages assigned. No leads to update.',
+      updated: 0,
+      failed: 0,
+      errors: []
+    });
+  }
+
+  const { rows, errors: parseErrors } = parseLeadCSV(req.file.buffer);
+  const errors = [...(parseErrors || [])];
+  let updated = 0;
+  let failed = 0;
+
+  for (const row of rows) {
+    const email = (row.email || '').trim().toLowerCase();
+    if (!email) {
+      failed++;
+      continue;
+    }
+    const lead = await Lead.findOne({
+      email: email.toLowerCase(),
+      landingPage: { $in: landingPageIds }
+    });
+    if (!lead) {
+      errors.push(`No lead found with email: ${row.email} in your assigned pages`);
+      failed++;
+      continue;
+    }
+    const updates = {};
+    if (row.firstName) updates.firstName = row.firstName;
+    if (row.lastName) updates.lastName = row.lastName;
+    if (row.phone !== undefined) updates.phone = row.phone;
+    if (row.company !== undefined) updates.company = row.company;
+    if (row.message !== undefined) updates.message = row.message;
+    if (row.status && VALID_STATUSES.includes(row.status.toLowerCase())) {
+      updates.status = row.status.toLowerCase();
+    }
+    if (row.lastContacted) {
+      const d = new Date(row.lastContacted);
+      if (!isNaN(d.getTime())) updates.lastContacted = d;
+    }
+    if (Object.keys(updates).length === 0) {
+      failed++;
+      continue;
+    }
+    await Lead.findByIdAndUpdate(lead._id, updates, { runValidators: true });
+    updated++;
+  }
+
+  res.status(200).json({
+    success: true,
+    message: `Leads update complete. Updated: ${updated}, Failed: ${failed}`,
+    updated,
+    failed,
+    errors: errors.length ? errors : undefined
+  });
+}));
+
 // @desc    Update lead status
 // @route   PUT /api/sub-admin/leads/:id/status
 // @access  Private (Sub Admin only)
@@ -301,7 +384,7 @@ router.put('/leads/:id/status', [
   });
 }));
 
-// @desc    Update lead details
+// @desc    Update lead details (including status and lastContacted)
 // @route   PUT /api/sub-admin/leads/:id
 // @access  Private (Sub Admin only)
 router.put('/leads/:id', [
@@ -310,7 +393,9 @@ router.put('/leads/:id', [
   body('email').optional().isEmail().normalizeEmail().withMessage('Please provide a valid email'),
   body('phone').optional().trim(),
   body('company').optional().trim(),
-  body('message').optional().trim()
+  body('message').optional().trim(),
+  body('status').optional().isIn(['new', 'contacted', 'qualified', 'converted', 'lost']).withMessage('Invalid status'),
+  body('lastContacted').optional().isISO8601().toDate()
 ], asyncHandler(async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
@@ -348,7 +433,9 @@ router.put('/leads/:id', [
     email: req.body.email,
     phone: req.body.phone,
     company: req.body.company,
-    message: req.body.message
+    message: req.body.message,
+    status: req.body.status,
+    lastContacted: req.body.lastContacted
   };
 
   // Remove undefined fields
