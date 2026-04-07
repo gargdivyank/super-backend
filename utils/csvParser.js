@@ -23,6 +23,9 @@ function parseCSVLine(line) {
 }
 
 const HEADER_MAP = {
+  'lead id': '_id',
+  '_id': '_id',
+  'id': '_id',
   email: 'email',
   'first name': 'firstName',
   firstname: 'firstName',
@@ -68,8 +71,8 @@ function parseLeadCSV(buffer) {
       const val = values[idx] !== undefined ? String(values[idx]).trim() : '';
       if (val) row[norm] = val;
     });
-    if (!row.email) {
-      errors.push(`Row ${i + 1}: missing email, skipped.`);
+    if (!row.email && !row._id) {
+      errors.push(`Row ${i + 1}: missing Lead ID or email, skipped.`);
       continue;
     }
     rows.push(row);

@@ -8,6 +8,7 @@ const LandingPage = require('../models/LandingPage');
 const { protect, authorize, checkApproval } = require('../middleware/auth');
 const asyncHandler = require('../utils/asyncHandler');
 const { parseLeadCSV } = require('../utils/csvParser');
+const { getLeadAnalyticsData, getEmptyAnalyticsData } = require('../utils/leadAnalytics');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } }); // 5MB
@@ -90,6 +91,34 @@ router.get('/landing-page', asyncHandler(async (req, res) => {
     success: true,
     data: accessRecords.map(record => record.landingPage)
   });
+}));
+
+// @desc    Lead analytics for sub-admin's assigned landing page(s) only
+// @route   GET /api/sub-admin/analytics
+// @access  Private (Sub Admin only)
+router.get('/analytics', asyncHandler(async (req, res) => {
+  const emptyData = getEmptyAnalyticsData();
+
+  const accessRecords = await AdminAccess.find({
+    subAdmin: req.user.id,
+    status: 'active'
+  });
+
+  const landingPageIds = accessRecords.map((record) => record.landingPage);
+
+  if (landingPageIds.length === 0) {
+    return res.status(200).json({ success: true, data: emptyData });
+  }
+
+  const match = { landingPage: { $in: landingPageIds } };
+
+  let landingPageMeta = null;
+  if (landingPageIds.length === 1) {
+    landingPageMeta = await LandingPage.findById(landingPageIds[0]).select('name url status');
+  }
+
+  const data = await getLeadAnalyticsData(match, landingPageMeta);
+  res.status(200).json({ success: true, data });
 }));
 
 // @desc    Get sub admin's leads
@@ -237,6 +266,7 @@ router.get('/leads/export', asyncHandler(async (req, res) => {
 
   // Format data for export
   const exportData = leads.map(lead => ({
+    'Lead ID': lead._id.toString(),
     'First Name': lead.firstName,
     'Last Name': lead.lastName,
     'Email': lead.email,
@@ -292,17 +322,27 @@ router.post('/leads/upload', upload.single('file'), asyncHandler(async (req, res
   let failed = 0;
 
   for (const row of rows) {
-    const email = (row.email || '').trim().toLowerCase();
-    if (!email) {
+    if (!row._id && !row.email) {
       failed++;
       continue;
     }
-    const lead = await Lead.findOne({
-      email: email.toLowerCase(),
-      landingPage: { $in: landingPageIds }
-    });
+
+    let lead;
+    if (row._id) {
+      lead = await Lead.findOne({
+        _id: row._id,
+        landingPage: { $in: landingPageIds }
+      });
+    } else if (row.email) {
+      const email = row.email.trim().toLowerCase();
+      lead = await Lead.findOne({
+        email,
+        landingPage: { $in: landingPageIds }
+      });
+    }
+
     if (!lead) {
-      errors.push(`No lead found with email: ${row.email} in your assigned pages`);
+      errors.push(`No lead found for row: ${row.email || row._id} in your assigned pages`);
       failed++;
       continue;
     }

@@ -9,6 +9,7 @@ const AdminAccess = require('../models/AdminAccess');
 const { protect, authorize } = require('../middleware/auth');
 const asyncHandler = require('../utils/asyncHandler');
 const { parseLeadCSV } = require('../utils/csvParser');
+const { getLeadAnalyticsData, getEmptyAnalyticsData } = require('../utils/leadAnalytics');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } }); // 5MB
@@ -749,14 +750,21 @@ router.post('/leads/upload', upload.single('file'), asyncHandler(async (req, res
   let failed = 0;
 
   for (const row of rows) {
-    const email = (row.email || '').trim().toLowerCase();
-    if (!email) {
+    if (!row._id && !row.email) {
       failed++;
       continue;
     }
-    const lead = await Lead.findOne({ email: email.toLowerCase() });
+
+    let lead;
+    if (row._id) {
+      lead = await Lead.findById(row._id);
+    } else if (row.email) {
+      const email = row.email.trim().toLowerCase();
+      lead = await Lead.findOne({ email });
+    }
+
     if (!lead) {
-      errors.push(`No lead found with email: ${row.email}`);
+      errors.push(`No lead found for row: ${row.email || row._id}`);
       failed++;
       continue;
     }
@@ -861,6 +869,7 @@ query.landingPage = { $in: activeLandingPageIds };
 
   // Format data for export
   const exportData = leads.map(lead => ({
+    'Lead ID': lead._id.toString(),
     'First Name': lead.firstName,
     'Last Name': lead.lastName,
     'Email': lead.email,
@@ -880,4 +889,246 @@ query.landingPage = { $in: activeLandingPageIds };
   });
 }));
 
+// @desc    Lead analytics for a landing page (or all active pages)
+// @route   GET /api/super-admin/analytics
+// @access  Private (Super Admin only)
+// router.get('/analytics', asyncHandler(async (req, res) => {
+//   const { landingPage: landingPageId } = req.query;
+
+//   const emptyData = {
+//     kpis: { new: 0, contacted: 0, qualified: 0, closed: 0 },
+//     landingPage: null,
+//     leadsOverTime: { daily: [], monthly: [], yearly: [] },
+//     bySource: [],
+//     byLocation: [],
+//     byDevice: []
+//   };
+
+//   const activeLandingPageIds = await LandingPage.find({ status: 'active' }).distinct('_id');
+
+//   if (!activeLandingPageIds.length) {
+//     return res.status(200).json({ success: true, data: emptyData });
+//   }
+
+//   let match = { landingPage: { $in: activeLandingPageIds } };
+//   let landingPageMeta = null;
+
+//   if (landingPageId) {
+//     if (!isValidObjectId(landingPageId)) {
+//       return res.status(400).json({
+//         success: false,
+//         message: 'Invalid landing page ID'
+//       });
+//     }
+
+//     const isActive = activeLandingPageIds.some(
+//       (id) => id.toString() === landingPageId.toString()
+//     );
+
+//     if (!isActive) {
+//       return res.status(200).json({ success: true, data: emptyData });
+//     }
+
+//     match = { landingPage: new mongoose.Types.ObjectId(landingPageId) };
+//     landingPageMeta = await LandingPage.findById(landingPageId).select('name url status');
+//   }
+
+//   const statusAgg = await Lead.aggregate([
+//     { $match: match },
+//     { $group: { _id: '$status', count: { $sum: 1 } } }
+//   ]);
+
+//   const counts = { new: 0, contacted: 0, qualified: 0, converted: 0, lost: 0 };
+
+//   statusAgg.forEach((row) => {
+//     if (row._id && Object.prototype.hasOwnProperty.call(counts, row._id)) {
+//       counts[row._id] = row.count;
+//     }
+//   });
+
+//   const kpis = {
+//     new: counts.new,
+//     contacted: counts.contacted,
+//     qualified: counts.qualified,
+//     closed: counts.converted + counts.lost
+//   };
+
+//   const timeSeries = (format) =>
+//     Lead.aggregate([
+//       { $match: match },
+//       {
+//         $group: {
+//           _id: {
+//             $dateToString: { format, date: '$createdAt', timezone: 'UTC' }
+//           },
+//           leads: { $sum: 1 }
+//         }
+//       },
+//       { $sort: { _id: 1 } },
+//       { $project: { _id: 0, period: '$_id', leads: 1 } }
+//     ]);
+
+//   const [daily, monthly, yearly, bySourceRaw, locAgg, byDeviceRaw] = await Promise.all([
+//     timeSeries('%Y-%m-%d'),
+//     timeSeries('%Y-%m'),
+//     timeSeries('%Y'),
+//     Lead.aggregate([
+//       { $match: match },
+//       {
+//         $addFields: {
+//           src: {
+//             $trim: {
+//               input: { $ifNull: ['$source', ''] }
+//             }
+//           }
+//         }
+//       },
+//       {
+//         $addFields: {
+//           src: {
+//             $cond: [{ $eq: ['$src', ''] }, 'Unknown', '$src']
+//           }
+//         }
+//       },
+//       { $group: { _id: '$src', count: { $sum: 1 } } },
+//       { $sort: { count: -1 } },
+//       { $project: { _id: 0, source: '$_id', count: 1 } }
+//     ]),
+//     Lead.aggregate([
+//       { $match: match },
+//       {
+//         $addFields: {
+//           loc: {
+//             $trim: {
+//               input: {
+//                 $ifNull: [
+//                   '$dynamicFields.geoLocation',
+//                   { $ifNull: ['$geoLocation', ''] }
+//                 ]
+//               }
+//             }
+//           }
+//         }
+//       },
+//       {
+//         $addFields: {
+//           loc: {
+//             $cond: [
+//               {
+//                 $or: [
+//                   { $eq: ['$loc', ''] },
+//                   { $eq: ['$loc', 'Unknown location'] }
+//                 ]
+//               },
+//               'Unknown',
+//               '$loc'
+//             ]
+//           }
+//         }
+//       },
+//       { $group: { _id: '$loc', count: { $sum: 1 } } },
+//       { $sort: { count: -1 } }
+//     ]),
+//     Lead.aggregate([
+//       { $match: match },
+//       {
+//         $addFields: {
+//           rawDevice: {
+//             $ifNull: [
+//               '$dynamicFields.deviceType',
+//               { $ifNull: ['$deviceType', ''] }
+//             ]
+//           }
+//         }
+//       },
+//       {
+//         $addFields: {
+//           bucket: {
+//             $switch: {
+//               branches: [
+//                 {
+//                   case: {
+//                     $in: [
+//                       { $toLower: '$rawDevice' },
+//                       ['mobile', 'tablet']
+//                     ]
+//                   },
+//                   then: 'Mobile'
+//                 },
+//                 {
+//                   case: {
+//                     $eq: [{ $toLower: '$rawDevice' }, 'desktop']
+//                   },
+//                   then: 'Desktop'
+//                 }
+//               ],
+//               default: 'Unknown'
+//             }
+//           }
+//         }
+//       },
+//       { $group: { _id: '$bucket', count: { $sum: 1 } } },
+//       { $project: { _id: 0, device: '$_id', count: 1 } },
+//       { $sort: { count: -1 } }
+//     ])
+//   ]);
+
+//   const locRows = locAgg.map((x) => ({ location: x._id, count: x.count }));
+//   const topLoc = locRows.slice(0, 15);
+//   const otherLocSum = locRows.slice(15).reduce((acc, r) => acc + r.count, 0);
+
+//   const byLocation =
+//     otherLocSum > 0
+//       ? [...topLoc, { location: 'Other', count: otherLocSum }]
+//       : topLoc;
+
+//   res.status(200).json({
+//     success: true,
+//     data: {
+//       kpis,
+//       landingPage: landingPageMeta,
+//       leadsOverTime: { daily, monthly, yearly },
+//       bySource: bySourceRaw,
+//       byLocation,
+//       byDevice: byDeviceRaw
+//     }
+//   });
+// }));
+router.get('/analytics', asyncHandler(async (req, res) => {
+  const { landingPage: landingPageId } = req.query;
+
+  const emptyData = getEmptyAnalyticsData();
+
+  const activeLandingPageIds = await LandingPage.find({ status: 'active' }).distinct('_id');
+
+  if (!activeLandingPageIds.length) {
+    return res.status(200).json({ success: true, data: emptyData });
+  }
+
+  let match = { landingPage: { $in: activeLandingPageIds } };
+  let landingPageMeta = null;
+
+  if (landingPageId) {
+    if (!isValidObjectId(landingPageId)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid landing page ID'
+      });
+    }
+
+    const isActive = activeLandingPageIds.some(
+      (id) => id.toString() === landingPageId.toString()
+    );
+
+    if (!isActive) {
+      return res.status(200).json({ success: true, data: emptyData });
+    }
+
+    match = { landingPage: new mongoose.Types.ObjectId(landingPageId) };
+    landingPageMeta = await LandingPage.findById(landingPageId).select('name url status');
+  }
+
+  const data = await getLeadAnalyticsData(match, landingPageMeta);
+  res.status(200).json({ success: true, data });
+}));
 module.exports = router; 
