@@ -1,5 +1,6 @@
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
+const { resolveUserPermissions } = require('../constants/permissions');
 
 // Protect routes
 exports.protect = async (req, res, next) => {
@@ -40,6 +41,30 @@ exports.authorize = (...roles) => {
         message: `User role ${req.user.role} is not authorized to access this route`
       });
     }
+    next();
+  };
+};
+
+// Grant access to users that own one (or more) required permissions.
+exports.authorizePermissions = (...requiredPermissions) => {
+  return (req, res, next) => {
+    // Keep super admins backward-compatible even if legacy rows have no permissions.
+    if (req.user.role === 'super_admin') {
+      return next();
+    }
+
+    const userPermissions = resolveUserPermissions(req.user);
+    const hasRequiredPermission = requiredPermissions.some((permission) =>
+      userPermissions.includes(permission)
+    );
+
+    if (!hasRequiredPermission) {
+      return res.status(403).json({
+        success: false,
+        message: 'You do not have permission to access this resource'
+      });
+    }
+
     next();
   };
 };

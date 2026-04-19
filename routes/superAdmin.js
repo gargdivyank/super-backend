@@ -6,10 +6,11 @@ const User = require('../models/User');
 const LandingPage = require('../models/LandingPage');
 const Lead = require('../models/Lead');
 const AdminAccess = require('../models/AdminAccess');
-const { protect, authorize } = require('../middleware/auth');
+const { protect, authorize, authorizePermissions } = require('../middleware/auth');
 const asyncHandler = require('../utils/asyncHandler');
 const { parseLeadCSV } = require('../utils/csvParser');
 const { getLeadAnalyticsData, getEmptyAnalyticsData } = require('../utils/leadAnalytics');
+const { PERMISSIONS, normalizePermissions, resolveUserPermissions } = require('../constants/permissions');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } }); // 5MB
@@ -28,7 +29,7 @@ router.use(authorize('super_admin'));
 // @desc    Get all landing pages
 // @route   GET /api/super-admin/landing-pages
 // @access  Private (Super Admin only)
-router.get('/landing-pages', asyncHandler(async (req, res) => {
+router.get('/landing-pages', authorizePermissions(PERMISSIONS.LANDING_PAGES_VIEW), asyncHandler(async (req, res) => {
   const { status, search, page = 1, limit = 10 } = req.query;
 
   let query = {};
@@ -81,7 +82,7 @@ router.get('/landing-pages', asyncHandler(async (req, res) => {
 // @desc    Create landing page
 // @route   POST /api/super-admin/landing-pages
 // @access  Private (Super Admin only)
-router.post('/landing-pages', [
+router.post('/landing-pages', authorizePermissions(PERMISSIONS.LANDING_PAGES_MANAGE), [
   body('name').trim().isLength({ min: 2 }).withMessage('Name must be at least 2 characters'),
   body('url').isURL().withMessage('Please provide a valid URL'),
   body('description').optional().trim()
@@ -137,7 +138,7 @@ router.post('/landing-pages', [
 // @desc    Update landing page
 // @route   PUT /api/super-admin/landing-pages/:id
 // @access  Private (Super Admin only)
-router.put('/landing-pages/:id', [
+router.put('/landing-pages/:id', authorizePermissions(PERMISSIONS.LANDING_PAGES_MANAGE), [
   body('name').optional().trim().isLength({ min: 2 }).withMessage('Name must be at least 2 characters'),
   body('url').optional().isURL().withMessage('Please provide a valid URL'),
   body('description').optional().trim(),
@@ -212,7 +213,7 @@ router.put('/landing-pages/:id', [
 // @desc    Delete landing page
 // @route   DELETE /api/super-admin/landing-pages/:id
 // @access  Private (Super Admin only)
-router.delete('/landing-pages/:id', asyncHandler(async (req, res) => {
+router.delete('/landing-pages/:id', authorizePermissions(PERMISSIONS.LANDING_PAGES_MANAGE), asyncHandler(async (req, res) => {
   if (!isValidObjectId(req.params.id)) {
     return res.status(400).json({
       success: false,
@@ -250,7 +251,7 @@ router.delete('/landing-pages/:id', asyncHandler(async (req, res) => {
 // @desc    Get all sub admins
 // @route   GET /api/super-admin/sub-admins
 // @access  Private (Super Admin only)
-router.get('/sub-admins', asyncHandler(async (req, res) => {
+router.get('/sub-admins', authorizePermissions(PERMISSIONS.SUB_ADMINS_VIEW), asyncHandler(async (req, res) => {
   const { status, search, page = 1, limit = 10 } = req.query;
 
   let query = { role: 'sub_admin' };
@@ -323,7 +324,7 @@ router.get('/sub-admins', asyncHandler(async (req, res) => {
 // @desc    Create sub admin
 // @route   POST /api/super-admin/sub-admins
 // @access  Private (Super Admin only)
-router.post('/sub-admins', [
+router.post('/sub-admins', authorizePermissions(PERMISSIONS.SUB_ADMINS_MANAGE), [
   body('name').trim().isLength({ min: 2 }).withMessage('Name must be at least 2 characters'),
   body('email').isEmail().normalizeEmail().withMessage('Please provide a valid email'),
   body('password').isLength({ min: 6 }).withMessage('Password must be at least 6 characters'),
@@ -339,6 +340,7 @@ router.post('/sub-admins', [
   }
 
   const { name, email, password, companyName, landingPageId, phone, status } = req.body;
+  const normalizedPermissions = normalizePermissions(req.body.permissions);
 
   // Check if user already exists
   const existingUser = await User.findOne({ email });
@@ -370,7 +372,8 @@ router.post('/sub-admins', [
     role: 'sub_admin',
     status: status || 'approved',
     approvedBy: req.user.id,
-    approvedAt: Date.now()
+    approvedAt: Date.now(),
+    ...(normalizedPermissions.length > 0 ? { permissions: normalizedPermissions } : {})
   });
 
   // Create admin access record if landing page is provided
@@ -398,6 +401,7 @@ router.post('/sub-admins', [
     message: 'Sub admin created successfully',
     data: {
       ...userWithAccess.toObject(),
+      permissions: resolveUserPermissions(userWithAccess),
       access,
       landingPage: access.length > 0 ? access[0].landingPage : null
     }
@@ -407,7 +411,7 @@ router.post('/sub-admins', [
 // @desc    Update sub admin
 // @route   PUT /api/super-admin/sub-admins/:id
 // @access  Private (Super Admin only)
-router.put('/sub-admins/:id', [
+router.put('/sub-admins/:id', authorizePermissions(PERMISSIONS.SUB_ADMINS_MANAGE), [
   body('name').optional().trim().isLength({ min: 2 }).withMessage('Name must be at least 2 characters'),
   body('companyName').optional().trim().isLength({ min: 2 }).withMessage('Company name must be at least 2 characters'),
   body('status').optional().isIn(['pending', 'approved', 'rejected']).withMessage('Invalid status'),
@@ -428,6 +432,7 @@ router.put('/sub-admins/:id', [
   }
 
   const { name, companyName, status, landingPageId, phone } = req.body;
+  const normalizedPermissions = normalizePermissions(req.body.permissions);
 
   const user = await User.findById(req.params.id);
   if (!user || user.role !== 'sub_admin') {
@@ -443,6 +448,9 @@ router.put('/sub-admins/:id', [
     companyName,
     status
   };
+  if (Array.isArray(req.body.permissions)) {
+    fieldsToUpdate.permissions = normalizedPermissions;
+  }
   if (phone && phone.trim() !== '') {
     fieldsToUpdate.phone = phone.trim();
   }
@@ -508,6 +516,7 @@ router.put('/sub-admins/:id', [
     message: 'Sub admin updated successfully',
     data: {
       ...updatedUser.toObject(),
+      permissions: resolveUserPermissions(updatedUser),
       access,
       landingPage: access.length > 0 ? access[0].landingPage : null
     }
@@ -517,7 +526,7 @@ router.put('/sub-admins/:id', [
 // @desc    Delete sub admin
 // @route   DELETE /api/super-admin/sub-admins/:id
 // @access  Private (Super Admin only)
-router.delete('/sub-admins/:id', asyncHandler(async (req, res) => {
+router.delete('/sub-admins/:id', authorizePermissions(PERMISSIONS.SUB_ADMINS_MANAGE), asyncHandler(async (req, res) => {
   const user = await User.findById(req.params.id);
 
   if (!user || user.role !== 'sub_admin') {
@@ -554,7 +563,7 @@ router.delete('/sub-admins/:id', asyncHandler(async (req, res) => {
 // @desc    Get all leads
 // @route   GET /api/super-admin/leads
 // @access  Private (Super Admin only)
-router.get('/leads', asyncHandler(async (req, res) => {
+router.get('/leads', authorizePermissions(PERMISSIONS.LEADS_VIEW), asyncHandler(async (req, res) => {
   const { 
     status, 
     landingPage, 
@@ -675,7 +684,7 @@ query.landingPage = { $in: activeLandingPageIds };
 // @desc    Update lead (status, lastContacted, and details)
 // @route   PUT /api/super-admin/leads/:id
 // @access  Private (Super Admin only)
-router.put('/leads/:id', [
+router.put('/leads/:id', authorizePermissions(PERMISSIONS.LEADS_EDIT), [
   body('firstName').optional().trim().isLength({ min: 2 }).withMessage('First name must be at least 2 characters'),
   body('lastName').optional().trim().isLength({ min: 2 }).withMessage('Last name must be at least 2 characters'),
   body('email').optional().isEmail().normalizeEmail().withMessage('Please provide a valid email'),
@@ -733,7 +742,7 @@ router.put('/leads/:id', [
 // @route   POST /api/super-admin/leads/upload
 // @access  Private (Super Admin only)
 const VALID_STATUSES = ['new', 'contacted', 'qualified', 'converted', 'lost'];
-router.post('/leads/upload', upload.single('file'), asyncHandler(async (req, res) => {
+router.post('/leads/upload', authorizePermissions(PERMISSIONS.LEADS_EDIT), upload.single('file'), asyncHandler(async (req, res) => {
   if (!req.file || !req.file.buffer) {
     return res.status(400).json({
       success: false,
@@ -801,7 +810,7 @@ router.post('/leads/upload', upload.single('file'), asyncHandler(async (req, res
 // @desc    Export leads
 // @route   GET /api/super-admin/leads/export
 // @access  Private (Super Admin only)
-router.get('/leads/export', asyncHandler(async (req, res) => {
+router.get('/leads/export', authorizePermissions(PERMISSIONS.LEADS_VIEW), asyncHandler(async (req, res) => {
   const { 
     status, 
     landingPage, 
@@ -1094,7 +1103,7 @@ query.landingPage = { $in: activeLandingPageIds };
 //     }
 //   });
 // }));
-router.get('/analytics', asyncHandler(async (req, res) => {
+router.get('/analytics', authorizePermissions(PERMISSIONS.ANALYTICS_VIEW), asyncHandler(async (req, res) => {
   const { landingPage: landingPageId } = req.query;
 
   const emptyData = getEmptyAnalyticsData();

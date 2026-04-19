@@ -3,6 +3,7 @@ const { body, validationResult } = require('express-validator');
 const User = require('../models/User');
 const { protect, authorize } = require('../middleware/auth');
 const asyncHandler = require('../utils/asyncHandler');
+const { resolveUserPermissions } = require('../constants/permissions');
 
 const router = express.Router();
 
@@ -60,7 +61,8 @@ router.post('/register', [
       role: user.role,
       status: user.status,
       companyName: user.companyName,
-      phone: user.phone
+      phone: user.phone,
+      permissions: resolveUserPermissions(user)
     }
   });
 }));
@@ -121,7 +123,8 @@ router.post('/login', [
       email: user.email,
       role: user.role,
       status: user.status,
-      companyName: user.companyName
+      companyName: user.companyName,
+      permissions: resolveUserPermissions(user)
     }
   });
 }));
@@ -131,10 +134,12 @@ router.post('/login', [
 // @access  Private
 router.get('/me', protect, asyncHandler(async (req, res) => {
   const user = await User.findById(req.user.id);
+  const payload = user.toObject();
+  payload.permissions = resolveUserPermissions(user);
 
   res.status(200).json({
     success: true,
-    data: user
+    data: payload
   });
 }));
 

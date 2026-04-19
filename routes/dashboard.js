@@ -4,8 +4,9 @@ const LandingPage = require('../models/LandingPage');
 const Lead = require('../models/Lead');
 const AccessRequest = require('../models/AccessRequest');
 const AdminAccess = require('../models/AdminAccess');
-const { protect, authorize } = require('../middleware/auth');
+const { protect, authorize, authorizePermissions } = require('../middleware/auth');
 const asyncHandler = require('../utils/asyncHandler');
+const { PERMISSIONS } = require('../constants/permissions');
 
 const router = express.Router();
 
@@ -16,7 +17,8 @@ router.use(protect);
 // @route   GET /api/dashboard/super-admin
 // @access  Private (Super Admin only)
 router.get('/super-admin', [
-  authorize('super_admin')
+  authorize('super_admin'),
+  authorizePermissions(PERMISSIONS.DASHBOARD_VIEW)
 ], asyncHandler(async (req, res) => {
   const { startDate, endDate } = req.query;
 
@@ -131,7 +133,8 @@ router.get('/super-admin', [
 // @route   GET /api/dashboard/sub-admin
 // @access  Private (Sub Admin only)
 router.get('/sub-admin', [
-  authorize('sub_admin')
+  authorize('sub_admin'),
+  authorizePermissions(PERMISSIONS.DASHBOARD_VIEW)
 ], asyncHandler(async (req, res) => {
   const { startDate, endDate } = req.query;
 

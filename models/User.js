@@ -1,6 +1,7 @@
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const { getDefaultPermissions, normalizePermissions } = require('../constants/permissions');
 
 const userSchema = new mongoose.Schema({
   name: {
@@ -29,6 +30,12 @@ const userSchema = new mongoose.Schema({
     type: String,
     enum: ['super_admin', 'sub_admin'],
     default: 'sub_admin'
+  },
+  permissions: {
+    type: [String],
+    default: function permissionsDefault() {
+      return getDefaultPermissions(this.role);
+    }
   },
   companyName: {
     type: String,
@@ -69,6 +76,22 @@ userSchema.pre('save', async function(next) {
   }
   const salt = await bcrypt.genSalt(10);
   this.password = await bcrypt.hash(this.password, salt);
+});
+
+// Normalize permissions. If an explicit empty array is stored, keep it (minimal access).
+// If missing/invalid and empty after normalize, fall back to role defaults.
+userSchema.pre('save', function(next) {
+  const normalized = normalizePermissions(this.permissions);
+  if (normalized.length > 0) {
+    this.permissions = normalized;
+    return next();
+  }
+  if (Array.isArray(this.permissions) && this.permissions.length === 0) {
+    this.permissions = [];
+    return next();
+  }
+  this.permissions = getDefaultPermissions(this.role);
+  next();
 });
 
 // Sign JWT and return

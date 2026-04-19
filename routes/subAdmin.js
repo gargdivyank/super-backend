@@ -5,10 +5,11 @@ const User = require('../models/User');
 const Lead = require('../models/Lead');
 const AdminAccess = require('../models/AdminAccess');
 const LandingPage = require('../models/LandingPage');
-const { protect, authorize, checkApproval } = require('../middleware/auth');
+const { protect, authorize, checkApproval, authorizePermissions } = require('../middleware/auth');
 const asyncHandler = require('../utils/asyncHandler');
 const { parseLeadCSV } = require('../utils/csvParser');
 const { getLeadAnalyticsData, getEmptyAnalyticsData } = require('../utils/leadAnalytics');
+const { PERMISSIONS, normalizePermissions, resolveUserPermissions } = require('../constants/permissions');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } }); // 5MB
@@ -18,10 +19,332 @@ router.use(protect);
 router.use(authorize('sub_admin'));
 router.use(checkApproval);
 
+async function getMyActiveLandingPageIds(req) {
+  const accessRecords = await AdminAccess.find({
+    subAdmin: req.user.id,
+    status: 'active'
+  });
+  return accessRecords.map((r) => r.landingPage.toString());
+}
+
+/** Target must be a sub_admin whose active landing pages are a non-empty subset of the caller's. */
+async function assertManagedSubAdminOnMyLandingPages(req, targetUserId) {
+  const myLpIds = await getMyActiveLandingPageIds(req);
+  if (myLpIds.length === 0) return null;
+
+  const target = await User.findById(targetUserId);
+  if (!target || target.role !== 'sub_admin') return null;
+  if (target._id.toString() === req.user.id.toString()) return null;
+
+  const targetAccess = await AdminAccess.find({
+    subAdmin: targetUserId,
+    status: 'active'
+  });
+  const targetLpIds = targetAccess.map((a) => a.landingPage.toString());
+  if (targetLpIds.length === 0) return null;
+
+  const shared = targetLpIds.some((id) => myLpIds.includes(id));
+  const subset = targetLpIds.every((id) => myLpIds.includes(id));
+  if (!shared || !subset) return null;
+
+  return { target, myLpIds, targetLpIds };
+}
+
+// @desc    List sub admins/users for the same assigned landing page(s)
+// @route   GET /api/sub-admin/sub-admins
+// @access  Private (Sub Admin only)
+router.get('/sub-admins', authorizePermissions(PERMISSIONS.SUB_ADMINS_VIEW), asyncHandler(async (req, res) => {
+  const accessRecords = await AdminAccess.find({
+    subAdmin: req.user.id,
+    status: 'active'
+  });
+
+  const landingPageIds = accessRecords.map((r) => r.landingPage);
+  if (landingPageIds.length === 0) {
+    return res.status(200).json({
+      success: true,
+      count: 0,
+      total: 0,
+      pagination: {},
+      data: []
+    });
+  }
+
+  const records = await AdminAccess.find({
+    landingPage: { $in: landingPageIds },
+    status: 'active'
+  }).populate('subAdmin', 'name email companyName phone status role permissions createdAt');
+
+  const deduped = new Map();
+  for (const record of records) {
+    const u = record.subAdmin;
+    if (!u) continue;
+    const id = u._id?.toString();
+    if (!id) continue;
+    if (id === req.user.id.toString()) continue; // hide yourself
+    if (!deduped.has(id)) deduped.set(id, u);
+  }
+
+  let users = Array.from(deduped.values()).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
+  const { search, page = 1, limit = 10 } = req.query;
+  const searchTrim = typeof search === 'string' ? search.trim() : '';
+
+  if (searchTrim) {
+    const q = searchTrim.toLowerCase();
+    users = users.filter((u) => {
+      const name = (u.name || '').toLowerCase();
+      const email = (u.email || '').toLowerCase();
+      const company = (u.companyName || '').toLowerCase();
+      return name.includes(q) || email.includes(q) || company.includes(q);
+    });
+  }
+
+  const pageNum = Math.max(1, parseInt(page, 10) || 1);
+  const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 10));
+  const total = users.length;
+  const startIndex = (pageNum - 1) * limitNum;
+  const pagedUsers = users.slice(startIndex, startIndex + limitNum);
+
+  const pagination = {};
+  const endIndex = startIndex + limitNum;
+  if (endIndex < total) {
+    pagination.next = { page: pageNum + 1, limit: limitNum };
+  }
+  if (startIndex > 0) {
+    pagination.prev = { page: pageNum - 1, limit: limitNum };
+  }
+
+  res.status(200).json({
+    success: true,
+    count: pagedUsers.length,
+    total,
+    pagination,
+    data: pagedUsers
+  });
+}));
+
+// @desc    Create a new sub admin for the same assigned landing page(s)
+// @route   POST /api/sub-admin/sub-admins
+// @access  Private (Sub Admin only)
+router.post('/sub-admins', authorizePermissions(PERMISSIONS.SUB_ADMINS_MANAGE), [
+  body('name').trim().isLength({ min: 2 }).withMessage('Name must be at least 2 characters'),
+  body('email').isEmail().normalizeEmail().withMessage('Please provide a valid email'),
+  body('password').isLength({ min: 6 }).withMessage('Password must be at least 6 characters'),
+  body('companyName').trim().isLength({ min: 2 }).withMessage('Company name must be at least 2 characters'),
+  body('phone').optional().trim().isLength({ min: 7 }).withMessage('Please provide a valid phone number'),
+  body('permissions').optional().isArray().withMessage('Permissions must be an array of strings')
+], asyncHandler(async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({
+      success: false,
+      errors: errors.array()
+    });
+  }
+
+  const { name, email, password, companyName, phone } = req.body;
+
+  // Sub-admin can only create users for their own assigned landing page(s).
+  const accessRecords = await AdminAccess.find({
+    subAdmin: req.user.id,
+    status: 'active'
+  });
+
+  if (accessRecords.length === 0) {
+    return res.status(403).json({
+      success: false,
+      message: 'No landing pages assigned. You cannot create sub admins.'
+    });
+  }
+
+  const existingUser = await User.findOne({ email });
+  if (existingUser) {
+    return res.status(400).json({
+      success: false,
+      message: 'User already exists with this email'
+    });
+  }
+
+  const creatorPermissions = new Set(resolveUserPermissions(req.user));
+  const requestedPermissions = normalizePermissions(req.body.permissions);
+
+  // If permissions aren't provided, default to core sub-admin modules (no sub-admin management).
+  const defaultChildPermissions = [
+    PERMISSIONS.DASHBOARD_VIEW,
+    PERMISSIONS.LEADS_VIEW,
+    PERMISSIONS.LEADS_EDIT,
+    PERMISSIONS.ANALYTICS_VIEW,
+    PERMISSIONS.PROFILE_VIEW,
+    PERMISSIONS.PROFILE_EDIT
+  ];
+
+  // Respect explicit permission list from UI (including empty). Only use defaults when field is omitted.
+  const hasExplicitPermissionsArray = Array.isArray(req.body.permissions);
+  const desiredPermissions = hasExplicitPermissionsArray
+    ? requestedPermissions
+    : defaultChildPermissions;
+  const childPermissions = desiredPermissions.filter((p) => creatorPermissions.has(p));
+
+  const user = await User.create({
+    name,
+    email,
+    password,
+    companyName,
+    phone,
+    role: 'sub_admin',
+    status: 'approved',
+    approvedBy: req.user.id,
+    approvedAt: Date.now(),
+    permissions: childPermissions
+  });
+
+  const landingPageIds = accessRecords.map((r) => r.landingPage);
+  await AdminAccess.insertMany(
+    landingPageIds.map((landingPageId) => ({
+      subAdmin: user._id,
+      landingPage: landingPageId,
+      grantedBy: req.user.id,
+      status: 'active',
+      grantedAt: Date.now()
+    })),
+    { ordered: false }
+  );
+
+  res.status(201).json({
+    success: true,
+    message: 'Sub admin created successfully',
+    data: {
+      id: user._id,
+      name: user.name,
+      email: user.email,
+      role: user.role,
+      status: user.status,
+      companyName: user.companyName,
+      permissions: user.permissions,
+      landingPagesAssigned: landingPageIds.length
+    }
+  });
+}));
+
+// @desc    Update a sub admin managed under the same landing page(s)
+// @route   PUT /api/sub-admin/sub-admins/:id
+// @access  Private (Sub Admin only)
+router.put('/sub-admins/:id', authorizePermissions(PERMISSIONS.SUB_ADMINS_MANAGE), [
+  body('name').optional().trim().isLength({ min: 2 }).withMessage('Name must be at least 2 characters'),
+  body('email').optional().isEmail().normalizeEmail().withMessage('Please provide a valid email'),
+  body('companyName').optional().trim().isLength({ min: 2 }).withMessage('Company name must be at least 2 characters'),
+  body('phone').optional().trim().isLength({ min: 7 }).withMessage('Please provide a valid phone number'),
+  body('password').optional().isLength({ min: 6 }).withMessage('Password must be at least 6 characters'),
+  body('status').optional().isIn(['pending', 'approved', 'rejected']).withMessage('Invalid status'),
+  body('permissions').optional().isArray().withMessage('Permissions must be an array of strings')
+], asyncHandler(async (req, res) => {
+  if (!req.params.id || req.params.id === 'undefined') {
+    return res.status(400).json({
+      success: false,
+      message: 'User ID is required'
+    });
+  }
+
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({
+      success: false,
+      errors: errors.array()
+    });
+  }
+
+  const ctx = await assertManagedSubAdminOnMyLandingPages(req, req.params.id);
+  if (!ctx) {
+    return res.status(404).json({
+      success: false,
+      message: 'Sub admin not found'
+    });
+  }
+
+  const { name, companyName, phone, password, status, email } = req.body;
+  const creatorPermissions = new Set(resolveUserPermissions(req.user));
+  const normalizedPermissions = normalizePermissions(req.body.permissions);
+
+  const fieldsToUpdate = {};
+  if (name !== undefined) fieldsToUpdate.name = name;
+  if (companyName !== undefined) fieldsToUpdate.companyName = companyName;
+  if (phone !== undefined && phone !== '') fieldsToUpdate.phone = phone.trim();
+  if (status !== undefined) fieldsToUpdate.status = status;
+  if (password) fieldsToUpdate.password = password;
+
+  if (email !== undefined && email.trim() !== '') {
+    const emailTaken = await User.findOne({
+      email: email.trim().toLowerCase(),
+      _id: { $ne: req.params.id }
+    });
+    if (emailTaken) {
+      return res.status(400).json({
+        success: false,
+        message: 'Another user already uses this email'
+      });
+    }
+    fieldsToUpdate.email = email.trim().toLowerCase();
+  }
+
+  if (Array.isArray(req.body.permissions)) {
+    fieldsToUpdate.permissions = normalizedPermissions.filter((p) => creatorPermissions.has(p));
+  }
+
+  Object.keys(fieldsToUpdate).forEach((key) => fieldsToUpdate[key] === undefined && delete fieldsToUpdate[key]);
+
+  if (Object.keys(fieldsToUpdate).length === 0) {
+    return res.status(400).json({
+      success: false,
+      message: 'No valid fields to update'
+    });
+  }
+
+  const userToUpdate = await User.findById(req.params.id);
+  if (!userToUpdate) {
+    return res.status(404).json({ success: false, message: 'Sub admin not found' });
+  }
+
+  Object.assign(userToUpdate, fieldsToUpdate);
+  await userToUpdate.save();
+
+  const updatedUser = await User.findById(req.params.id).select('-password');
+
+  res.status(200).json({
+    success: true,
+    message: 'Sub admin updated successfully',
+    data: {
+      ...updatedUser.toObject(),
+      permissions: resolveUserPermissions(updatedUser)
+    }
+  });
+}));
+
+// @desc    Delete a sub admin managed under the same landing page(s)
+// @route   DELETE /api/sub-admin/sub-admins/:id
+// @access  Private (Sub Admin only)
+router.delete('/sub-admins/:id', authorizePermissions(PERMISSIONS.SUB_ADMINS_MANAGE), asyncHandler(async (req, res) => {
+  const ctx = await assertManagedSubAdminOnMyLandingPages(req, req.params.id);
+  if (!ctx) {
+    return res.status(404).json({
+      success: false,
+      message: 'Sub admin not found'
+    });
+  }
+
+  await AdminAccess.deleteMany({ subAdmin: req.params.id });
+  await User.findByIdAndDelete(req.params.id);
+
+  res.status(200).json({
+    success: true,
+    message: 'Sub admin deleted successfully'
+  });
+}));
+
 // @desc    Get sub admin profile
 // @route   GET /api/sub-admin/profile
 // @access  Private (Sub Admin only)
-router.get('/profile', asyncHandler(async (req, res) => {
+router.get('/profile', authorizePermissions(PERMISSIONS.PROFILE_VIEW), asyncHandler(async (req, res) => {
   const user = await User.findById(req.user.id).select('-password');
 
   res.status(200).json({
@@ -33,7 +356,7 @@ router.get('/profile', asyncHandler(async (req, res) => {
 // @desc    Update sub admin profile
 // @route   PUT /api/sub-admin/profile
 // @access  Private (Sub Admin only)
-router.put('/profile', [
+router.put('/profile', authorizePermissions(PERMISSIONS.PROFILE_EDIT), [
   body('name').optional().trim().isLength({ min: 2 }).withMessage('Name must be at least 2 characters'),
   // body('companyName').optional().trim().isLength({ min: 2 }).withMessage('Company name must be at least 2 characters')
   body('phone').optional().trim().isLength({ min: 7 }).withMessage('Please provide a valid phone number'),
@@ -96,7 +419,7 @@ router.get('/landing-page', asyncHandler(async (req, res) => {
 // @desc    Lead analytics for sub-admin's assigned landing page(s) only
 // @route   GET /api/sub-admin/analytics
 // @access  Private (Sub Admin only)
-router.get('/analytics', asyncHandler(async (req, res) => {
+router.get('/analytics', authorizePermissions(PERMISSIONS.ANALYTICS_VIEW), asyncHandler(async (req, res) => {
   const emptyData = getEmptyAnalyticsData();
 
   const accessRecords = await AdminAccess.find({
@@ -124,7 +447,7 @@ router.get('/analytics', asyncHandler(async (req, res) => {
 // @desc    Get sub admin's leads
 // @route   GET /api/sub-admin/leads
 // @access  Private (Sub Admin only)
-router.get('/leads', asyncHandler(async (req, res) => {
+router.get('/leads', authorizePermissions(PERMISSIONS.LEADS_VIEW), asyncHandler(async (req, res) => {
   const { 
     status, 
     search, 
@@ -219,7 +542,7 @@ router.get('/leads', asyncHandler(async (req, res) => {
 // @desc    Export sub admin's leads
 // @route   GET /api/sub-admin/leads/export
 // @access  Private (Sub Admin only)
-router.get('/leads/export', asyncHandler(async (req, res) => {
+router.get('/leads/export', authorizePermissions(PERMISSIONS.LEADS_VIEW), asyncHandler(async (req, res) => {
   const { 
     status, 
     search, 
@@ -290,7 +613,7 @@ router.get('/leads/export', asyncHandler(async (req, res) => {
 // @route   POST /api/sub-admin/leads/upload
 // @access  Private (Sub Admin only)
 const VALID_STATUSES = ['new', 'contacted', 'qualified', 'converted', 'lost'];
-router.post('/leads/upload', upload.single('file'), asyncHandler(async (req, res) => {
+router.post('/leads/upload', authorizePermissions(PERMISSIONS.LEADS_EDIT), upload.single('file'), asyncHandler(async (req, res) => {
   if (!req.file || !req.file.buffer) {
     return res.status(400).json({
       success: false,
@@ -379,7 +702,7 @@ router.post('/leads/upload', upload.single('file'), asyncHandler(async (req, res
 // @desc    Update lead status
 // @route   PUT /api/sub-admin/leads/:id/status
 // @access  Private (Sub Admin only)
-router.put('/leads/:id/status', [
+router.put('/leads/:id/status', authorizePermissions(PERMISSIONS.LEADS_EDIT), [
   body('status').isIn(['new', 'contacted', 'qualified', 'converted', 'lost']).withMessage('Invalid status')
 ], asyncHandler(async (req, res) => {
   const errors = validationResult(req);
@@ -427,7 +750,7 @@ router.put('/leads/:id/status', [
 // @desc    Update lead details (including status and lastContacted)
 // @route   PUT /api/sub-admin/leads/:id
 // @access  Private (Sub Admin only)
-router.put('/leads/:id', [
+router.put('/leads/:id', authorizePermissions(PERMISSIONS.LEADS_EDIT), [
   body('firstName').optional().trim().isLength({ min: 2 }).withMessage('First name must be at least 2 characters'),
   body('lastName').optional().trim().isLength({ min: 2 }).withMessage('Last name must be at least 2 characters'),
   body('email').optional().isEmail().normalizeEmail().withMessage('Please provide a valid email'),
@@ -499,7 +822,7 @@ router.put('/leads/:id', [
 // @desc    Get sub admin dashboard stats
 // @route   GET /api/sub-admin/dashboard-stats
 // @access  Private (Sub Admin only)
-router.get('/dashboard-stats', asyncHandler(async (req, res) => {
+router.get('/dashboard-stats', authorizePermissions(PERMISSIONS.DASHBOARD_VIEW), asyncHandler(async (req, res) => {
   const { startDate, endDate } = req.query;
 
   // Get sub admin's assigned landing pages
